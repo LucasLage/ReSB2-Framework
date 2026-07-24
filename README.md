@@ -114,3 +114,32 @@ Subdirectories:
 * `bi_encoder_output/` – trained bi-encoder model
 * `cross_encoder_output/` – trained cross-encoder model
 * `testing_result/` – testing result
+
+---
+
+## Citation
+
+If you use this framework, please cite:
+
+```bibtex
+@inproceedings{lage2026resb2,
+  title={ReSB²: Machine-Assisted Linking of Legislative Bills using Domain-Adapted ModernBERT and Explainable AI},
+  author={Lage, Lucas Gabriel and others},
+  booktitle={Proceedings of the ACM Conference on Hypertext and Social Media},
+  year={2026}
+}
+```
+
+---
+
+## License
+
+Please refer to the licenses of the original legislative data providers.
+
+This repository distributes processed versions of publicly available legislative documents for research purposes.
+
+---
+
+## Acknowledgments
+
+This work was supported by the Legislative Assembly of Minas Gerais (ALMG), CNPq, CAPES, and FAPEMIG.
