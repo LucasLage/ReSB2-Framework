@@ -1,0 +1,712 @@
+import os
+import json
+import math
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+from datasets import Dataset
+from sklearn.metrics import precision_score, recall_score, f1_score
+import torch
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from functools import partial
+import re
+
+### Prevent warning overload
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import warnings
+warnings.filterwarnings('ignore')
+from datasets.utils.logging import disable_progress_bar
+disable_progress_bar()
+from transformers import logging as hf_logging
+import datasets
+# Silence all HF logs
+datasets.logging.set_verbosity_error()
+hf_logging.set_verbosity_error()
+# Disable datasets progress bars entirely
+datasets.logging.disable_progress_bar()
+hf_logging.disable_progress_bar()
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+from .open_search_operator import OpenSearchOperator
+
+class ModelTester:
+    """
+    A utility class for evaluating different embedding and ranking setups.
+
+    This class orchestrates the loading of test datasets, initialization of
+    bi-encoder and cross-encoder paths, construction of OpenSearch indexes,
+    and preparation of evaluation configurations. It supports testing multiple
+    retrieval and re-ranking pipelines under different legislative session
+    constraints and encoder combinations.
+
+    Attributes
+    ----------
+    open_ai_index : str
+        Name of the OpenSearch index containing precomputed embeddings, when applicable.
+    contex_size : int
+        Maximum context window size for the bi-encoder and cross-encoder when encoding text.
+    bi_encoder_path : str
+        Path to the trained bi-encoder model.
+    cross_encoder_path : str
+        Path to the trained cross-encoder model.
+    result_path : str
+        Directory where evaluation results will be stored.
+    os_handler : OpenSearchOperator
+        Handler responsible for executing OpenSearch operations.
+    df_proposition_detail : pandas.DataFrame
+        Dataset of proposition details indexed by `doc_id`.
+    df_test : pandas.DataFrame
+        Subset of the test dataset containing only positive (similar) pairs.
+    df_data_index : pandas.DataFrame
+        Indexing metadata used during search and evaluation.
+    df_ex_proj_sim : pandas.DataFrame
+        External file containing precomputed similar propositions (Ex-Projeto de Lei).
+    similarity_relation : dict
+        Mapping of similarity relations between documents.
+    similarity_relation_same_session : dict
+        Similarity relations restricted to the same legislative session.
+    cases : list of dict
+        List of evaluation conditions (e.g., same legislative session vs. unrestricted).
+    setups : list of dict
+        Configuration options defining different retrieval pipelines to be evaluated.
+    """
+    def __init__(self,
+                 work_dir: str,
+                 open_ai_index:str,
+                 os_handler : OpenSearchOperator,
+                 contex_size: int
+        ):
+        self.open_ai_index = open_ai_index
+        # Contex size defined as pipeline param
+        self.contex_size = contex_size
+        
+        self.bi_encoder_path = f"{work_dir}/bi_encoder_output/model" 
+        self.cross_encoder_path = f"{work_dir}/cross_encoder_output/model"
+        
+        self.result_path = f"{work_dir}/testing_result"
+        os.makedirs(self.result_path, exist_ok=True)
+        
+        self.os_handler = os_handler
+
+        proposition_path = f"{work_dir}/data/almg_proposition_pre_processed.csv"
+        self.df_proposition_detail = pd.read_csv(proposition_path)
+        self.df_proposition_detail = self.df_proposition_detail.copy().set_index("doc_id")
+
+        test_path = f"{work_dir}/data/test.csv"
+        df_test_raw = pd.read_csv(test_path)
+        self.df_test = df_test_raw[df_test_raw['label'] == 1]
+        self.df_data_index = self._get_data_index(df_test_raw)
+
+        ex_proj_sim_path = f"{work_dir}/data/almg_similars_ex_project.csv"
+        self.df_ex_proj_sim = pd.read_csv(ex_proj_sim_path)
+
+        sim_rel, sim_rel_same_session = self._get_similarity_relation()
+        self.similarity_relation = sim_rel
+        self.similarity_relation_same_session = sim_rel_same_session
+        
+        # List of evaluation conditions (e.g., same legislative session vs. unrestricted).
+        self.cases = [
+            {"name": "mesma_sessao_legislativa", "use_legislative_session": True},
+            {"name": "sem_regras", "use_legislative_session": False},
+        ]
+
+    # list of Configuration options defining different retrieval pipelines to be evaluated.
+    #
+    # "name": Name of the evaluation setup.
+    # "idx_name": Name of the OpenSearch index to be created or queried.
+    # "embedding_by_index": If set, embeddings are retrieved from this index instead of generated by the bi-encoder.
+    # "cross_encoder": Path to the cross-encoder model (None means not used in this setup).
+    # "bi_encoder": Path to the bi-encoder model (None means not used in this setup).
+    # "context_size_bi_encoder": Context window size for the bi-encoder; ignored when bi-encoder is not used.
+    # "embedding_dimension": Dimensionality of the embedding vectors; if None, the bi-encoder’s dimension is used.
+    # "create_index": Whether a new OpenSearch index should be created for this setup.
+        self.setups = [
+            {
+                "name": f"openai_large",
+                "idx_name": "openai_large_test_idx",
+                "embedding_by_index": self.open_ai_index,
+                "cross_encoder": None,
+                "bi_encoder": None,
+                "context_size_bi_encoder": None,
+                "embedding_dimension": 3072,
+                "create_index": True
+            },
+            {
+                "name": f"bi_enconder",
+                "idx_name": f"bi_enconder_test_idx",
+                "embedding_by_index": None,
+                "cross_encoder": None,
+                "bi_encoder": self.bi_encoder_path,
+                "context_size_bi_encoder": self.contex_size, # Contex size defined as pipeline param
+                "embedding_dimension": None,
+                "create_index": True
+            },
+            {
+                "name": f"bi_enconder-cross_enconder",
+                "idx_name": f"bi_enconder_test_idx",
+                "embedding_by_index": None,
+                "cross_encoder": self.cross_encoder_path,
+                "bi_encoder": self.bi_encoder_path,
+                "context_size_bi_encoder": self.contex_size, # Contex size defined as pipeline param
+                "embedding_dimension": None,
+                "create_index": False
+            },
+        ]
+    
+    def _get_data_index (self, df_test_raw):
+        """
+        Builds a deduplicated index of documents appearing in the test dataset.
+
+        The method extracts doc_id and preprocessed text from both sides of the
+        test pairs, merges them into a unified list, removes duplicates, and
+        attaches metadata (legislature and legislative session) to each entry.
+        This index is later used for embedding generation and OpenSearch indexing.
+
+        Parameters
+        ----------
+        df_test_raw : pandas.DataFrame
+            Raw test dataset containing paired documents (doc_id_1, doc_id_2)
+            and their preprocessed text.
+
+        Returns
+        -------
+        pandas.DataFrame
+            A DataFrame with unique documents containing:
+            - doc_id
+            - preprocessed_text
+            - legislature
+            - legislative_session
+
+        Notes
+        -----
+        Metadata is retrieved using the internal method `_get_metadata(doc_id)`.
+        The final DataFrame is deduplicated and indexed sequentially.
+        """
+        df_1 = df_test_raw[["doc_id_1","preprocessed_text_1"]].rename(
+            columns={
+                "doc_id_1": "doc_id",
+                "preprocessed_text_1": "preprocessed_text"
+            }
+        )
+        
+        df_2 = df_test_raw[["doc_id_2","preprocessed_text_2"]].rename(
+            columns={
+                "doc_id_2": "doc_id",
+                "preprocessed_text_2": "preprocessed_text"
+            }
+        )
+
+        df_concat = pd.concat([df_1, df_2], ignore_index=True)
+        df_concat = df_concat.drop_duplicates(subset=["doc_id", "preprocessed_text"])
+        df_data_index = df_concat.reset_index(drop=True)
+
+
+        def extract_meta(doc_id):
+            meta = self._get_metadata(doc_id)
+            return meta["legislature"], meta["legislative_session"]
+        
+        df_data_index["legislature"], df_data_index["legislative_session"] = zip(
+            *df_data_index.doc_id.apply(extract_meta)
+        )
+                
+        return df_data_index
+
+    @staticmethod
+    def _safe_value(value):
+        return None if value is None or (isinstance(value, float) and math.isnan(value)) else value
+
+    def _get_metadata(self, doc_id):
+        """
+        Retrieves and sanitizes metadata for a given document identifier.
+
+        Parameters
+        ----------
+        doc_id : Unique identifier of the document whose metadata will be retrieved.
+    
+        Returns
+        -------
+        dict
+            A dictionary containing:
+            - text : str
+                The document's preprocessed text.
+            - legislature : str or None
+                The legislature number, sanitized to None if missing or invalid.
+            - legislative_session : str or None
+                The legislative session number, similarly sanitized.
+
+        """
+        aux = self.df_proposition_detail.loc[doc_id]
+        return {
+            "text": aux.preprocessed_text,
+            "legislature": ModelTester._safe_value(aux.legislature),
+            "legislative_session": ModelTester._safe_value(aux.legislative_session)   
+        }
+
+    def _get_similarity_relation(self):
+        """
+        Builds similarity mappings between documents based on test pairs and
+        extended similarity relations.
+    
+        This method scans all distinct documents present in the test dataset and
+        constructs two dictionaries describing their similarity relationships:
+        one containing *all* known similar documents, and another restricted to
+        documents belonging to the *same legislative session*.
+    
+        For each document, similarity is determined by:
+        - Direct test set links (doc_id_1 ↔ doc_id_2)
+        - Extended similarity pairs found in `df_ex_proj_sim`. These ex-project pairs will be used during the test stage to reduce false negatives in the dataset.
+    
+        Metadata is attached to every entry using `_get_metadata(doc_id)`.
+    
+        Returns
+        -------
+        tuple(dict, dict)
+            A tuple containing:
+            
+            similarity_relation : dict
+                Maps each document ID to:
+                - text : str
+                    Preprocessed document text
+                - legislature : str or None
+                    Legislature number
+                - legislative_session : str or None
+                    Legislative session number
+                - relevant_docs : list
+                    All documents considered similar to this one
+    
+            similarity_relation_same_session : dict
+                Same structure as above, but includes *only* similar documents
+                belonging to the same legislature and legislative session.
+    
+        Notes
+        -----
+        - Only documents appearing in the original test dataset are considered.
+        - Duplicate similarity relationships are removed using set operations.
+        - Session-specific similarity is computed by filtering relevant documents
+          based on matching metadata fields.
+        """
+        distinct_docs = set(self.df_test.doc_id_1.to_list() + self.df_test.doc_id_2.to_list())
+        distinct_docs_index = set(self.df_data_index.doc_id.to_list())
+
+        similarity_relation = {}
+        similarity_relation_same_session = {}
+        for d in distinct_docs:
+            similars_1 = self.df_test[self.df_test["doc_id_1"] == d].doc_id_2.to_list()
+            similars_2 = self.df_test[self.df_test["doc_id_2"] == d].doc_id_1.to_list()
+        
+        
+            similars_1_ex_proj = self.df_ex_proj_sim[self.df_ex_proj_sim["doc_id_1"] == d].doc_id_2.to_list()
+            similars_2_ex_proj = self.df_ex_proj_sim[self.df_ex_proj_sim["doc_id_2"] == d].doc_id_1.to_list()
+        
+            similars = set(similars_1 + similars_2 + similars_1_ex_proj + similars_2_ex_proj)
+        
+        
+            obj = self._get_metadata(d)
+            similars = list(similars & distinct_docs_index)
+            similarity_relation[d] = {
+                "text": obj["text"],
+                "legislature": obj["legislature"],
+                "legislative_session": obj["legislative_session"],
+                "relevant_docs" : similars
+            }
+    
+            similars_same_session = []
+            for s in similars:
+                obj_2 = self._get_metadata(s)
+                if (
+                    (obj["legislature"] == obj_2["legislature"]) and
+                    (obj["legislative_session"] == obj_2["legislative_session"])
+                ):
+                    similars_same_session.append(s)
+        
+            if len(similars_same_session) > 0:
+                similarity_relation_same_session[d] = {
+                    "text": obj["text"],
+                    "legislature": obj["legislature"],
+                    "legislative_session": obj["legislative_session"],
+                    "relevant_docs" : similars_same_session
+                }
+
+        return (similarity_relation, similarity_relation_same_session)
+
+    def _calculate_metrics(self, response_docs, relevant_docs):
+        """
+        Computes retrieval evaluation metrics (Recall@K and MRR@K) for a ranked list
+        of returned documents.
+
+        Parameters
+        ----------
+        response_docs : list
+            Ranked list of retrieved document IDs produced by the model.
+    
+        relevant_docs : list or set
+            Set of ground-truth relevant document IDs for a given query.
+    
+        Returns
+        -------
+        dict
+            A mapping containing the following keys for each cutoff K:
+            - "Recall@K" : float
+            - "MRR@K" : float
+
+        """
+        results = {}
+        for k in [1, 2, 5, 10, 15, 20]:
+            top_k = response_docs[:k]
+            y_true = [1 if d in relevant_docs else 0 for d in top_k]
+            y_pred = [1]*len(top_k)
+            recall = recall_score(y_true, y_pred, zero_division=0)
+
+            mrr = 0
+            for i, d in enumerate(top_k):
+                if d in relevant_docs:
+                    mrr = 1/(i+1)
+                    break
+
+            results[f"Recall@{k}"] = recall
+            results[f"MRR@{k}"] = mrr
+
+        return results
+
+    def _tokenize_function(self, batch , tokenizer):
+        """
+        Tokenizes paired text inputs for the classification (cross-encoder) model.
+    
+        Parameters
+        ----------
+        batch : dict
+            A batch of examples containing:
+            - 'query': list of query strings
+            - 'texto': list of document strings
+    
+        tokenizer : transformers.PreTrainedTokenizer
+            A Hugging Face tokenizer used to encode the paired inputs.
+    
+        Returns
+        -------
+        dict
+            A dictionary containing tokenized model inputs, including:
+            - input_ids
+            - attention_mask
+            - token_type_ids (if supported by the tokenizer)
+
+        """
+
+        # Contex size defined as pipeline param
+        size = 2 * self.contex_size
+        texts1_aux = batch['query']
+        texts1 = []
+
+        # For performance reasons.
+        # After tokenization, subword segmentation ensures that the resulting token sequence typically contains even more units than the original word count, so no semantic information is lost.
+        for t in texts1_aux:
+            head = t.split(' ')[:size]
+            text = ' '.join(head)
+            texts1.append(text)
+    
+        texts2_aux = batch['texto']
+        texts2 = []
+        for t in texts2_aux:
+            head = t.split(' ')[:size]
+            text = ' '.join(head)
+            texts2.append(text)
+    
+        
+        # Tokenize
+        return tokenizer (
+            texts1,
+            texts2,
+            truncation=True,
+            padding='max_length',
+            max_length=size
+        )
+
+    def _evaluate_rank(
+        self,
+        index_name,
+        similarity_relation,
+        embedding_by_index,
+        model_classification = None,
+        tokenizer = None,
+        device = None,
+        use_legislative_session = False,
+    ):
+        """
+        Evaluates ranking performance for a set of query documents against an index.
+    
+        This method computes metrics for each document in the provided similarity relation. 
+        For every query document, the method retrieves candidates from OpenSearch using k-NN vector search,
+        optionally re-ranks them with a cross-encoder model, and finally computes
+        ranking metrics such as Recall@K and MRR@K.
+    
+        Workflow
+        --------
+        For each document in `similarity_relation`:
+          1. Retrieve its metadata (text, legislature, session, and relevant docs).
+          2. Obtain the document's embedding: embeddings are fetched from an
+               existing index instead of being computed, for performance reasons.
+          3. Search OpenSearch for the top-K nearest documents.
+             - Session filtering is applied if `use_legislative_session=True`.
+          4. Optionally re-rank retrieved candidates using a cross-encoder:
+             - Inputs are tokenized via `_tokenize_function`.
+             - Model outputs are passed through a sigmoid to obtain relevance scores.
+          5. Sort candidates by relevance score.
+          6. Compute ranking metrics using `_calculate_metrics`.
+    
+        Parameters
+        ----------
+        index_name : str
+            Name of the index used for k-NN search.
+    
+        similarity_relation : dict
+            A dictionary mapping doc_id → metadata object, where each object contains:
+            - "text": preprocessed text of the document
+            - "legislature": integer or None
+            - "legislative_session": integer or None
+            - "relevant_docs": list of doc_ids considered true positives
+    
+        embedding_by_index : str or None
+            Embeddings are retrieved from this index instead of
+            computed, for performance reasons.
+    
+        model_classification : transformers.PreTrainedModel, optional
+            Cross-encoder model used for re-ranking. If None, ranking relies solely
+            on k-NN scores from OpenSearch.
+    
+        tokenizer : transformers.PreTrainedTokenizer, optional
+            Tokenizer used for re-ranking when `model_classification` is provided.
+    
+        device : torch.device, optional
+            Device to which model inputs and weights are moved (CPU or GPU).
+    
+        use_legislative_session : bool, default False
+            Whether the search should restrict candidates to the same legislature
+            and legislative session as the query document.
+    
+        Returns
+        -------
+        list of dict
+            A list of metric dictionaries, one for each evaluated document.  
+            Each dictionary includes:
+            - Recall@K and MRR@K values
+            - doc_id of the evaluated query document
+
+        """
+        list_result = []
+        for doc_1 in tqdm(similarity_relation, total=len(similarity_relation)):
+            obj = similarity_relation[doc_1]
+            doc_1_text = obj["text"]
+            legislature = obj["legislature"]
+            legislative_session = obj["legislative_session"]
+            relevant_docs = obj["relevant_docs"]
+            
+            embedding = self.os_handler.get_embedding(embedding_by_index, doc_1)
+
+            docs_df = self.os_handler.search_documment(
+                index_name, embedding, legislature, legislative_session, doc_1, use_legislative_session
+            )
+
+            if model_classification:
+                docs_df["query"] = doc_1_text
+                test_dataset = Dataset.from_pandas(docs_df)
+                tokenize_with_tok = partial(self._tokenize_function, tokenizer=tokenizer)
+                test_dataset = test_dataset.map(tokenize_with_tok,
+                                                  batched=True,
+                                                  batch_size=100,
+                                                  num_proc=1,
+                                                  desc=None)
+                def classify(example):
+                    inputs = {
+                        "input_ids": torch.tensor(example["input_ids"]),
+                        "attention_mask": torch.tensor(example["attention_mask"]),
+                    }
+                    if "token_type_ids" in example:
+                        inputs["token_type_ids"] = torch.tensor(example["token_type_ids"])
+
+                    # move the tensors to device
+                    inputs = {key: value.to(device) for key, value in inputs.items()}
+
+                    with torch.no_grad():
+                        logits = model_classification(**inputs).logits
+                        scores = torch.sigmoid(logits).squeeze(-1).cpu().tolist()
+                
+                    return {
+                        "score": scores
+                    }
+                    
+                predicted_dataset = test_dataset.map(
+                    classify, batched=True, batch_size=25, desc=None
+                )
+                docs_df["score"] = predicted_dataset["score"]
+
+            docs_df = docs_df.sort_values("score", ascending=False)
+            
+            predicted = docs_df.doc_id.to_list()
+            result = self._calculate_metrics(predicted, relevant_docs)
+            result["doc_id"] = doc_1
+            list_result.append(result)
+
+        return list_result
+    
+    def _log_jsonl(self, file_path, item):
+        """
+        Ensures a JSONL file exists, then appends one or more items to it.
+        
+        Args:
+            file_path (str): Path to the .jsonl file.
+            item_or_list (dict | list[dict]): A single dict or list of dicts to append.
+        """
+        # Create empty file if it doesn't exist
+        if not os.path.exists(file_path):
+            open(file_path, 'w', encoding='utf-8').close()
+        
+        # Append each JSON line
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+    
+    def execute_experiments(self):
+        """
+        Executes the full benchmark pipeline across all configured experimental setups.
+    
+        This method orchestrates the complete evaluation process, including:
+        - index creation and embedding generation (when applicable),
+        - OpenSearch indexing,
+        - cross-encoder loading,
+        - document retrieval,
+        - re-ranking (optional),
+        - metric computation,
+        - and results logging.
+    
+        The evaluation is executed for each combination of:
+        (1) model setup (bi-encoder, cross-encoder, OpenAI embeddings, etc.)
+        (2) retrieval rule (e.g., same legislative session vs. no restrictions).
+    
+        Returns
+        -------
+        None
+            The method writes multiple CSV and JSONL result files to
+            `self.result_path`, but does not return any object.
+    
+        Notes
+        -----
+        - This method may be computationally expensive: it performs large-scale
+          embedding generation, OpenSearch indexing, query evaluation, and
+          optional cross-encoder inference.
+        - Retrieval and re-ranking behavior depends heavily on the setup:
+          bi-encoder-only, bi+cross, or OpenAI embeddings.
+        - Each setup and each case is evaluated independently, producing
+          comparable metrics across configurations.
+        """
+        metricas_list = []
+
+        # 1. **Iterate through the experiment setups (`self.setups`)**  
+        # Each setup defines how embeddings will be generated, whether the index
+        # needs to be created, which model to load, and embedding dimensionality.
+        for s in self.setups:
+        
+            index_name = "proposicao_"+s["idx_name"]
+            print("Index name", index_name)
+
+            embedding_by_index = None
+            # 2. **Index creation and embedding generation**  
+            # If `create_index=True`, a new OpenSearch index is created.  
+            if s["create_index"] == True:
+                # If the setup not provides `embedding_by_index`,
+                if s["embedding_by_index"] is None:
+                    embedding_by_index = None
+                    # Embeddings are computed using a SentenceTransformer model
+                    model_name = s["bi_encoder"]
+                    model_embedding = SentenceTransformer(model_name, trust_remote_code=True)
+                    # with the configured context size.
+                    model_embedding.max_seq_length = s["context_size_bi_encoder"]
+
+                else:
+                    # Otherwise, embeddings are *fetched* from an existing index instead of generated.
+                    embedding_by_index = s["embedding_by_index"]
+                    model_embedding = None
+                
+                if s["embedding_dimension"] is not None:
+                    embedding_dimension = s["embedding_dimension"]
+                else:
+                    embedding_dimension = model_embedding.get_sentence_embedding_dimension()
+
+                self.os_handler.create_index(index_name, embedding_dimension)
+                self.os_handler.index_data(index_name, self.df_data_index, model_embedding, embedding_by_index)
+                
+                    
+            # 3. **Model loading for cross-encoder re-ranking**  
+            # If the setup specifies a cross-encoder path, the method loads
+            if s["cross_encoder"] is not None:
+                model_name = s["cross_encoder"]
+                # `AutoModelForSequenceClassification` for scoring document pairs,
+                model_classification = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1)
+                model_classification.eval()
+                # and places the model on GPU if available.
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model_classification.to(device)  # move the model to device
+                # the corresponding tokenizer,
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+            else:
+                model_classification = None
+                tokenizer = None
+                device = None
+        
+            # 4. **Determine embedding source for retrieval**  
+            # If embeddings were generated in this run, the method uses the newly
+            # created index; otherwise, it uses the provided external embedding index.
+            if embedding_by_index is None:
+                embedding_by_index = index_name
+
+            log_file_path = f"{self.result_path}/log_file.jsonl"
+
+            # 5. **Iterate through retrieval scenarios (`self.cases`)**  
+            # For each case (e.g., with or without filtering by legislative session):
+            for c in self.cases:
+                setup_name = s["name"]
+                # - Selects the appropriate similarity mapping.
+                use_legislative_session = c["use_legislative_session"]
+                if use_legislative_session == True:
+                    sim_rel = self.similarity_relation_same_session
+                else:
+                    sim_rel = self.similarity_relation
+
+                # - Calls `_evaluate_rank()` to perform retrieval and optional re-ranking. 
+                list_result = self._evaluate_rank(
+                    index_name,
+                    sim_rel,
+                    model_classification=model_classification,
+                    tokenizer=tokenizer,
+                    device=device,
+                    use_legislative_session=use_legislative_session,
+                    embedding_by_index=embedding_by_index
+                )
+                # - Saves ranking results per document to CSV.
+                df_list_result = pd.DataFrame(list_result)
+                df_list_result.to_csv(f"{self.result_path}/{setup_name}_{c['name']}_list_result.csv", index=False)
+        
+                # 6. **Metric aggregation**  
+                metric_cols = [
+                    "Recall@1","MRR@1","Recall@2","MRR@2","Recall@5","MRR@5",
+                    "Recall@10","MRR@10","Recall@15","MRR@15","Recall@20","MRR@20"
+                ]
+                
+                # Computes mean values for Recall@k and MRR@k (k ∈ {1, 2, 5, 10, 15, 20})
+                agg_df = df_list_result[metric_cols].mean().to_frame().T
+                
+                # across all evaluated queries and stores them with setup metadata.
+                agg_df["setup_name"] = setup_name
+                agg_df["regra"] = c["name"]
+                
+                # 7. **Logging and result consolidation**  
+                metricas = agg_df.to_dict(orient="records")[0]
+                print(metricas)
+                # - Writes per-setup metrics to a `.jsonl` log file.
+                self._log_jsonl(log_file_path, metricas)
+                # - Accumulates global results in memory.        
+                metricas_list.append(metricas)
+
+        # - Outputs a final `results.csv` summarizing all evaluated setups.
+        df_metricas_list = pd.DataFrame(metricas_list)
+        df_metricas_list.to_csv(f"{self.result_path}/results.csv", index=False)
